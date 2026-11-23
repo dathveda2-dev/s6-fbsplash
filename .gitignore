@@ -1,0 +1,7 @@
+s6-fbsplash
+dist/
+*.o
+*.ppm
+*.ff
+*.bgra
+*.psfu

@@ -1,0 +1,37 @@
+name: CI & Release
+
+on:
+  push:
+    branches: [main, master]
+    tags: ["v*"]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install console-data for PSF2 test font
+        run: sudo apt-get update && sudo apt-get install -y console-data
+      - name: Build with gcc (-Werror)
+        run: make CC=gcc
+      - name: Run test suite
+        run: make test
+
+  release:
+    needs: check
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build release archive
+        run: make dist
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/s6-fbsplash-*.tar.gz
+            dist/s6-fbsplash-*.tar.gz.sha256
+          generate_release_notes: true
