@@ -806,14 +806,22 @@ static int run_pty_loop(char **child_argv, uint8_t *fb, uint32_t stride,
     pfds[1].events = POLLIN;
 
     uint8_t rbuf[4096];
+    int status = 0;
+    int child_done = 0;
     for (;;) {
-        nfds_t nfds = (pfds[1].fd >= 0) ? 2 : 1;
-        int pr = poll(pfds, nfds, 100);
+        if (!child_done && waitpid(pid, &status, WNOHANG) == pid)
+            child_done = 1;
+
+        nfds_t nfds = (pfds[1].fd >= 0 && !child_done) ? 2 : 1;
+        int pr = poll(pfds, nfds, child_done ? 0 : 100);
         if (pr < 0) {
             if (errno == EINTR) continue;
             break;
         }
-        if (pr == 0) continue;
+        if (pr == 0) {
+            if (child_done) break;
+            continue;
+        }
 
         if (pfds[0].revents & POLLIN) {
             ssize_t n = read(master_fd, rbuf, sizeof(rbuf));
@@ -837,8 +845,8 @@ static int run_pty_loop(char **child_argv, uint8_t *fb, uint32_t stride,
         }
     }
 
-    int status = 0;
-    waitpid(pid, &status, 0);
+    if (!child_done)
+        waitpid(pid, &status, 0);
     close(master_fd);
     if (restored_tio) tcsetattr(tty_fd, TCSANOW, &saved_tio);
 
