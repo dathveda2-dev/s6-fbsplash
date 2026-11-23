@@ -62,22 +62,22 @@ typedef struct {
 } config_t;
 
 static const uint32_t PALETTE[16] = {
-    0xFF121212u, /* 0 black */
-    0xFFE60000u, /* 1 red */
-    0xFF4EC970u, /* 2 green */
-    0xFFE5B567u, /* 3 yellow */
-    0xFF6E82B4u, /* 4 blue */
-    0xFFB05AA8u, /* 5 magenta */
-    0xFF7AA2C8u, /* 6 cyan */
-    0xFFE0E0E0u, /* 7 white */
-    0xFF5A5A64u, /* 8 bright black */
-    0xFFFF3333u, /* 9 bright red */
-    0xFF6EE08Cu, /* 10 bright green */
-    0xFFF2CD7Fu, /* 11 bright yellow */
-    0xFF8CA0D2u, /* 12 bright blue */
-    0xFFD078C4u, /* 13 bright magenta */
-    0xFFA0C4E0u, /* 14 bright cyan */
-    0xFFFFFFFFu  /* 15 bright white */
+    0xFF121212u,
+    0xFFE60000u,
+    0xFF4EC970u,
+    0xFFE5B567u,
+    0xFF6E82B4u,
+    0xFFB05AA8u,
+    0xFF7AA2C8u,
+    0xFFE0E0E0u,
+    0xFF5A5A64u,
+    0xFFFF3333u,
+    0xFF6EE08Cu,
+    0xFFF2CD7Fu,
+    0xFF8CA0D2u,
+    0xFFD078C4u,
+    0xFFA0C4E0u,
+    0xFFFFFFFFu
 };
 
 static uint16_t umap_cp[65536];
@@ -534,7 +534,7 @@ static void handle_sgr(const char *params) {
 }
 
 static void feed_bytes(const uint8_t *buf, ssize_t len) {
-    static int esc_state = 0; /* 0=normal, 1=ESC, 2=CSI, 3=OSC */
+    static int esc_state = 0;
     static char csi_buf[64];
     static int csi_len = 0;
     static uint32_t utf8_cp = 0;
