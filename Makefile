@@ -1,19 +1,25 @@
 CC ?= gcc
 CFLAGS ?= -Wall -Wextra -Werror -O2 -std=c99
-LDFLAGS ?= -lutil
+STB_CFLAGS ?= -O2 -std=c99 -Wno-unused-function -Wno-sign-compare
+LDFLAGS ?= -lutil -lm
 PREFIX ?= /usr/local
 BINDIR := $(PREFIX)/bin
-VERSION := 1.0.0
+VERSION := 1.1.0
 
 TARGET := s6-fbsplash
 SRC := src/s6-fbsplash.c
+STB_SRC := src/stb_impl.c
+STB_OBJ := stb_impl.o
 
 .PHONY: all test install uninstall clean dist
 
 all: $(TARGET)
 
-$(TARGET): $(SRC)
-	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
+$(STB_OBJ): $(STB_SRC) vendor/stb_image.h
+	$(CC) $(STB_CFLAGS) -c -o $@ $<
+
+$(TARGET): $(SRC) $(STB_OBJ)
+	$(CC) $(CFLAGS) -o $@ $(SRC) $(STB_OBJ) $(LDFLAGS)
 
 test: $(TARGET)
 	@bash tests/test_fbsplash.sh ./$(TARGET)
@@ -28,7 +34,7 @@ uninstall:
 	@echo "✔ Uninstalled $(TARGET) from $(DESTDIR)$(BINDIR)"
 
 clean:
-	@rm -rf $(TARGET) dist
+	@rm -rf $(TARGET) $(STB_OBJ) dist
 
 dist: clean
 	@mkdir -p dist

@@ -22,17 +22,19 @@ make
 sudo make install   # installs to /usr/local/bin/s6-fbsplash
 ```
 
-## Preparing Assets
+## Preparing Assets (Built-in, Zero External Tools)
 
-Convert any wallpaper to Farbfeld (`.ff`) using ImageMagick (`magick` / `convert`) or `ffmpeg`:
+`s6-fbsplash` includes a built-in image decoder (`stb_image` — PNG, JPEG, BMP, TGA, GIF, PNM) and **Farbfeld (`.ff`)** converter with aspect-preserving cover-crop and 3-pass box blur:
 
 ```bash
-# ImageMagick
-magick wallpaper.jpg -resize 1920x1200^ -gravity center -extent 1920x1200 /etc/s6/background.ff
+# Convert any PNG/JPG directly to a 1920x1200 blurred Farbfeld backdrop
+./s6-fbsplash --convert wallpaper.jpg /etc/s6/background.ff --bg-size 1920x1200 --blur 18
 
-# Or copy an uncompressed PSF2 console font
+# Copy an uncompressed PSF2 console font
 zcat /usr/share/consolefonts/LatGrkCyr-12x22.psfu.gz > /etc/s6/font.psfu
 ```
+
+*(You can also pass `.png` / `.jpg` directly to `--bg`, though `.ff` is fastest during early boot since it needs zero decompression.)*
 
 Preview your theme without rebooting:
 

@@ -21,7 +21,28 @@ if (( rc != 42 )); then
 fi
 echo "✓ Missing-asset fallback preserves exit code (42)"
 
-# 3. Headless Farbfeld + PSF2 + ANSI SGR render test (--render-ppm)
+# 3. Built-in Farbfeld converter (--convert with cover-crop & --blur)
+python3 - "${TMP}/in.ppm" <<'PY'
+import sys
+w, h = 160, 160
+with open(sys.argv[1], "wb") as f:
+    f.write(f"P6\n{w} {h}\n255\n".encode())
+    f.write(b"\x80\x20\x30" * (w * h))
+PY
+
+"${BIN}" --convert "${TMP}/in.ppm" "${TMP}/converted.ff" --bg-size 128x72 --blur 4
+python3 - "${TMP}/converted.ff" <<'PY'
+import struct, sys
+with open(sys.argv[1], "rb") as f:
+    data = f.read()
+assert data[:8] == b"farbfeld", f"bad magic: {data[:8]!r}"
+w, h = struct.unpack(">II", data[8:16])
+assert (w, h) == (128, 72), f"unexpected size: {(w, h)}"
+assert len(data) == 16 + 128 * 72 * 8, f"unexpected length: {len(data)}"
+PY
+echo "✓ Built-in --convert (PPM -> 128x72 blurred Farbfeld) passed"
+
+# 4. Headless Farbfeld + PSF2 + ANSI SGR render test (--render-ppm)
 FONT_PATH=""
 for candidate in /usr/share/consolefonts/*.psfu.gz /usr/share/kbd/consolefonts/*.psfu.gz; do
     if [[ -f "${candidate}" ]]; then

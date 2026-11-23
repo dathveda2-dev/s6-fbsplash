@@ -16,7 +16,9 @@
 #include <termios.h>
 #include <unistd.h>
 
-#define S6_FBSPLASH_VERSION "1.0.0"
+#include "../vendor/stb_image.h"
+
+#define S6_FBSPLASH_VERSION "1.1.0"
 #define PSF2_MAGIC 0x864ab572u
 #define MAX_ROWS 128
 #define MAX_COLS 320
@@ -45,6 +47,8 @@ typedef struct {
     const char *badge;
     const char *title;
     const char *render_ppm;
+    const char *convert_in;
+    const char *convert_out;
     uint32_t accent;
     uint32_t bg_w;
     uint32_t bg_h;
@@ -52,6 +56,8 @@ typedef struct {
     uint32_t render_h;
     uint8_t panel_alpha;
     int margin;
+    int blur_radius;
+    int bg_size_explicit;
     int forward_input;
 } config_t;
 
@@ -93,11 +99,13 @@ static void print_usage(const char *prog) {
         "Zero-dependency Linux framebuffer bootsplash & PTY console wrapper for s6/init.\n"
         "\n"
         "Options:\n"
-        "  --bg <path>         Background image (.ff Farbfeld or raw .bgra)\n"
+        "  --bg <path>         Background image (.ff, .png, .jpg, .bmp, .tga, .ppm, .bgra)\n"
         "  --font <path>       PSF2 console font (.psfu)\n"
         "  --fb <path>         Framebuffer device (default: /dev/fb0)\n"
         "  --tty <path>        TTY device for KD_GRAPHICS/input (default: /dev/tty1)\n"
-        "  --bg-size <WxH>     Raw .bgra dimensions (default: 1920x1200; ignored for .ff)\n"
+        "  --bg-size <WxH>     Target size for --convert or raw .bgra (default: 1920x1200)\n"
+        "  --blur <radius>     Apply box/Gaussian-like blur (0-64, default: 0)\n"
+        "  --convert <in> <out.ff>  Convert PNG/JPG/BMP/TGA/PPM/FF to Farbfeld (.ff)\n"
         "  --title <text>      Header title (default: \"Gentoo Linux // s6-svscan\")\n"
         "  --badge <text>      Header badge (default: \"s6\")\n"
         "  --accent <RRGGBB>   Accent bar hex color (default: e60000)\n"
@@ -136,6 +144,15 @@ static int parse_wxh(const char *s, uint32_t *w, uint32_t *h) {
 static inline uint32_t read_be32(const uint8_t *p) {
     return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
            ((uint32_t)p[2] << 8)  | (uint32_t)p[3];
+}
+
+static void free_background(void);
+
+static inline void write_be32(uint8_t *p, uint32_t v) {
+    p[0] = (uint8_t)((v >> 24) & 0xFF);
+    p[1] = (uint8_t)((v >> 16) & 0xFF);
+    p[2] = (uint8_t)((v >> 8)  & 0xFF);
+    p[3] = (uint8_t)(v & 0xFF);
 }
 
 static int load_background(const char *path, uint32_t *w_out, uint32_t *h_out) {
@@ -183,6 +200,34 @@ static int load_background(const char *path, uint32_t *w_out, uint32_t *h_out) {
         return 0;
     }
 
+    if (fsz <= (size_t)0x7FFFFFFF) {
+        int sw = 0, sh = 0, comp = 0;
+        unsigned char *rgba = stbi_load_from_memory(raw, (int)fsz, &sw, &sh, &comp, 4);
+        if (rgba && sw > 0 && sh > 0) {
+            munmap(raw, fsz);
+            size_t total = (size_t)sw * (size_t)sh;
+            uint32_t *pix = malloc(total * sizeof(uint32_t));
+            if (!pix) {
+                stbi_image_free(rgba);
+                return -1;
+            }
+            for (size_t i = 0; i < total; i++) {
+                uint8_t r = rgba[i * 4 + 0];
+                uint8_t g = rgba[i * 4 + 1];
+                uint8_t b = rgba[i * 4 + 2];
+                pix[i] = 0xFF000000u | ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
+            }
+            stbi_image_free(rgba);
+            bg_pixels = pix;
+            bg_pixels_mapped = 0;
+            bg_pixels_sz = total * sizeof(uint32_t);
+            *w_out = (uint32_t)sw;
+            *h_out = (uint32_t)sh;
+            return 0;
+        }
+        if (rgba) stbi_image_free(rgba);
+    }
+
     size_t expected = (size_t)(*w_out) * (*h_out) * 4;
     if (fsz < expected) {
         munmap(raw, fsz);
@@ -191,6 +236,176 @@ static int load_background(const char *path, uint32_t *w_out, uint32_t *h_out) {
     bg_pixels = (uint32_t *)(void *)raw;
     bg_pixels_mapped = 1;
     bg_pixels_sz = fsz;
+    return 0;
+}
+
+static uint32_t sample_bilinear(const uint32_t *src, uint32_t sw, uint32_t sh,
+                                double fx, double fy) {
+    if (fx < 0.0) fx = 0.0;
+    if (fy < 0.0) fy = 0.0;
+    if (fx > (double)(sw - 1)) fx = (double)(sw - 1);
+    if (fy > (double)(sh - 1)) fy = (double)(sh - 1);
+
+    uint32_t x0 = (uint32_t)fx;
+    uint32_t y0 = (uint32_t)fy;
+    uint32_t x1 = (x0 + 1 < sw) ? x0 + 1 : x0;
+    uint32_t y1 = (y0 + 1 < sh) ? y0 + 1 : y0;
+
+    uint32_t wx = (uint32_t)((fx - (double)x0) * 256.0);
+    uint32_t wy = (uint32_t)((fy - (double)y0) * 256.0);
+    uint32_t iwx = 256 - wx;
+    uint32_t iwy = 256 - wy;
+
+    uint32_t c00 = src[(size_t)y0 * sw + x0];
+    uint32_t c10 = src[(size_t)y0 * sw + x1];
+    uint32_t c01 = src[(size_t)y1 * sw + x0];
+    uint32_t c11 = src[(size_t)y1 * sw + x1];
+
+    uint32_t w00 = iwx * iwy;
+    uint32_t w10 = wx  * iwy;
+    uint32_t w01 = iwx * wy;
+    uint32_t w11 = wx  * wy;
+
+    uint32_t r = (((c00 >> 16) & 0xFF) * w00 + ((c10 >> 16) & 0xFF) * w10 +
+                  ((c01 >> 16) & 0xFF) * w01 + ((c11 >> 16) & 0xFF) * w11) >> 16;
+    uint32_t g = (((c00 >> 8)  & 0xFF) * w00 + ((c10 >> 8)  & 0xFF) * w10 +
+                  ((c01 >> 8)  & 0xFF) * w01 + ((c11 >> 8)  & 0xFF) * w11) >> 16;
+    uint32_t b = ((c00 & 0xFF)         * w00 + (c10 & 0xFF)         * w10 +
+                  (c01 & 0xFF)         * w01 + (c11 & 0xFF)         * w11) >> 16;
+    return 0xFF000000u | (r << 16) | (g << 8) | b;
+}
+
+static int cover_resize_bg(uint32_t dw, uint32_t dh, uint32_t *sw_io, uint32_t *sh_io) {
+    uint32_t sw = *sw_io, sh = *sh_io;
+    if (sw == dw && sh == dh) return 0;
+
+    uint32_t *dst = malloc((size_t)dw * dh * sizeof(uint32_t));
+    if (!dst) return -1;
+
+    double s_aspect = (double)sw / (double)sh;
+    double d_aspect = (double)dw / (double)dh;
+    double crop_w = (double)sw, crop_h = (double)sh;
+    double off_x = 0.0, off_y = 0.0;
+    if (s_aspect > d_aspect) {
+        crop_w = (double)sh * d_aspect;
+        off_x = ((double)sw - crop_w) * 0.5;
+    } else if (s_aspect < d_aspect) {
+        crop_h = (double)sw / d_aspect;
+        off_y = ((double)sh - crop_h) * 0.5;
+    }
+
+    for (uint32_t y = 0; y < dh; y++) {
+        double sy = off_y + (((double)y + 0.5) * crop_h / (double)dh) - 0.5;
+        for (uint32_t x = 0; x < dw; x++) {
+            double sx = off_x + (((double)x + 0.5) * crop_w / (double)dw) - 0.5;
+            dst[(size_t)y * dw + x] = sample_bilinear(bg_pixels, sw, sh, sx, sy);
+        }
+    }
+
+    free_background();
+    bg_pixels = dst;
+    bg_pixels_mapped = 0;
+    bg_pixels_sz = (size_t)dw * dh * sizeof(uint32_t);
+    *sw_io = dw;
+    *sh_io = dh;
+    return 0;
+}
+
+static void box_blur_bg(uint32_t w, uint32_t h, int radius) {
+    if (radius <= 0 || !bg_pixels || w == 0 || h == 0) return;
+    uint32_t *tmp = malloc((size_t)w * h * sizeof(uint32_t));
+    if (!tmp) return;
+
+    int win = radius * 2 + 1;
+    for (int pass = 0; pass < 3; pass++) {
+        for (uint32_t y = 0; y < h; y++) {
+            const uint32_t *row = bg_pixels + (size_t)y * w;
+            uint32_t *out = tmp + (size_t)y * w;
+            uint32_t sr = 0, sg = 0, sb = 0;
+            for (int k = -radius; k <= radius; k++) {
+                uint32_t sx = (k < 0) ? 0 : ((uint32_t)k >= w ? w - 1 : (uint32_t)k);
+                uint32_t px = row[sx];
+                sr += (px >> 16) & 0xFF;
+                sg += (px >> 8)  & 0xFF;
+                sb += px & 0xFF;
+            }
+            for (uint32_t x = 0; x < w; x++) {
+                out[x] = 0xFF000000u | ((sr / (uint32_t)win) << 16) |
+                         ((sg / (uint32_t)win) << 8) | (sb / (uint32_t)win);
+                int sub_x = (int)x - radius;
+                int add_x = (int)x + radius + 1;
+                uint32_t p_sub = row[sub_x < 0 ? 0 : (uint32_t)sub_x];
+                uint32_t p_add = row[(uint32_t)add_x >= w ? w - 1 : (uint32_t)add_x];
+                sr += ((p_add >> 16) & 0xFF) - ((p_sub >> 16) & 0xFF);
+                sg += ((p_add >> 8)  & 0xFF) - ((p_sub >> 8)  & 0xFF);
+                sb += (p_add & 0xFF)         - (p_sub & 0xFF);
+            }
+        }
+        for (uint32_t x = 0; x < w; x++) {
+            uint32_t sr = 0, sg = 0, sb = 0;
+            for (int k = -radius; k <= radius; k++) {
+                uint32_t sy = (k < 0) ? 0 : ((uint32_t)k >= h ? h - 1 : (uint32_t)k);
+                uint32_t px = tmp[(size_t)sy * w + x];
+                sr += (px >> 16) & 0xFF;
+                sg += (px >> 8)  & 0xFF;
+                sb += px & 0xFF;
+            }
+            for (uint32_t y = 0; y < h; y++) {
+                bg_pixels[(size_t)y * w + x] = 0xFF000000u |
+                    ((sr / (uint32_t)win) << 16) | ((sg / (uint32_t)win) << 8) |
+                    (sb / (uint32_t)win);
+                int sub_y = (int)y - radius;
+                int add_y = (int)y + radius + 1;
+                uint32_t p_sub = tmp[(size_t)(sub_y < 0 ? 0 : (uint32_t)sub_y) * w + x];
+                uint32_t p_add = tmp[(size_t)((uint32_t)add_y >= h ? h - 1 : (uint32_t)add_y) * w + x];
+                sr += ((p_add >> 16) & 0xFF) - ((p_sub >> 16) & 0xFF);
+                sg += ((p_add >> 8)  & 0xFF) - ((p_sub >> 8)  & 0xFF);
+                sb += (p_add & 0xFF)         - (p_sub & 0xFF);
+            }
+        }
+    }
+    free(tmp);
+}
+
+static int write_farbfeld(const char *path, uint32_t w, uint32_t h) {
+    if (!bg_pixels) return -1;
+    FILE *fp = fopen(path, "wb");
+    if (!fp) return -1;
+
+    uint8_t hdr[16];
+    memcpy(hdr, "farbfeld", 8);
+    write_be32(hdr + 8, w);
+    write_be32(hdr + 12, h);
+    if (fwrite(hdr, 1, 16, fp) != 16) {
+        fclose(fp);
+        return -1;
+    }
+
+    uint8_t *row = malloc((size_t)w * 8);
+    if (!row) {
+        fclose(fp);
+        return -1;
+    }
+    for (uint32_t y = 0; y < h; y++) {
+        const uint32_t *src = bg_pixels + (size_t)y * w;
+        for (uint32_t x = 0; x < w; x++) {
+            uint32_t px = src[x];
+            uint8_t r = (uint8_t)((px >> 16) & 0xFF);
+            uint8_t g = (uint8_t)((px >> 8)  & 0xFF);
+            uint8_t b = (uint8_t)(px & 0xFF);
+            row[x * 8 + 0] = r; row[x * 8 + 1] = r;
+            row[x * 8 + 2] = g; row[x * 8 + 3] = g;
+            row[x * 8 + 4] = b; row[x * 8 + 5] = b;
+            row[x * 8 + 6] = 0xFF; row[x * 8 + 7] = 0xFF;
+        }
+        if (fwrite(row, 1, (size_t)w * 8, fp) != (size_t)w * 8) {
+            free(row);
+            fclose(fp);
+            return -1;
+        }
+    }
+    free(row);
+    fclose(fp);
     return 0;
 }
 
@@ -430,7 +645,13 @@ static void init_bg_panel(uint32_t stride, uint32_t xres, uint32_t yres,
             uint32_t bx = (x * cfg->bg_w) / xres;
             uint32_t px = src_row[bx];
             if (in_box_y && x >= box_x0 && x < box_x1) {
-                px = is_accent ? cfg->accent : blend_dark(px, cfg->panel_alpha);
+                int is_border = (x == box_x0 || x + 1 == box_x1 || y + 1 == box_y1);
+                if (is_accent)
+                    px = cfg->accent;
+                else if (is_border)
+                    px = blend_dark(px, 220);
+                else
+                    px = blend_dark(px, cfg->panel_alpha);
             }
             dst[x] = px;
         }
@@ -623,6 +844,8 @@ int main(int argc, char **argv) {
         .badge = "s6",
         .title = "Gentoo Linux // s6-svscan",
         .render_ppm = NULL,
+        .convert_in = NULL,
+        .convert_out = NULL,
         .accent = 0xFFE60000u,
         .bg_w = 1920,
         .bg_h = 1200,
@@ -630,6 +853,8 @@ int main(int argc, char **argv) {
         .render_h = 720,
         .panel_alpha = 165,
         .margin = 64,
+        .blur_radius = 0,
+        .bg_size_explicit = 0,
         .forward_input = 1
     };
 
@@ -646,6 +871,13 @@ int main(int argc, char **argv) {
             return 0;
         } else if (strcmp(argv[i], "--no-input") == 0) {
             cfg.forward_input = 0;
+        } else if (strcmp(argv[i], "--convert") == 0) {
+            if (i + 2 >= argc) {
+                fprintf(stderr, "Usage: --convert <input> <output.ff>\n");
+                return 2;
+            }
+            cfg.convert_in = argv[++i];
+            cfg.convert_out = argv[++i];
         } else if (i + 1 >= argc) {
             fprintf(stderr, "Missing value for %s\n", argv[i]);
             return 2;
@@ -673,6 +905,14 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "Invalid --bg-size (expected WxH)\n");
                 return 2;
             }
+            cfg.bg_size_explicit = 1;
+        } else if (strcmp(argv[i], "--blur") == 0) {
+            long r = strtol(argv[++i], NULL, 10);
+            if (r < 0 || r > 64) {
+                fprintf(stderr, "Invalid --blur (expected 0-64)\n");
+                return 2;
+            }
+            cfg.blur_radius = (int)r;
         } else if (strcmp(argv[i], "--render-size") == 0) {
             if (parse_wxh(argv[++i], &cfg.render_w, &cfg.render_h) < 0) {
                 fprintf(stderr, "Invalid --render-size (expected WxH)\n");
@@ -698,6 +938,36 @@ int main(int argc, char **argv) {
         }
     }
 
+    if (cfg.convert_in && cfg.convert_out) {
+        uint32_t target_w = cfg.bg_w;
+        uint32_t target_h = cfg.bg_h;
+        uint32_t src_w = cfg.bg_w;
+        uint32_t src_h = cfg.bg_h;
+        if (load_background(cfg.convert_in, &src_w, &src_h) < 0) {
+            fprintf(stderr, "Failed to decode image: %s\n", cfg.convert_in);
+            return 1;
+        }
+        if (cfg.bg_size_explicit) {
+            if (cover_resize_bg(target_w, target_h, &src_w, &src_h) < 0) {
+                free_background();
+                fprintf(stderr, "Out of memory resizing image\n");
+                return 1;
+            }
+        }
+        if (cfg.blur_radius > 0)
+            box_blur_bg(src_w, src_h, cfg.blur_radius);
+        if (write_farbfeld(cfg.convert_out, src_w, src_h) < 0) {
+            free_background();
+            fprintf(stderr, "Failed to write Farbfeld: %s\n", cfg.convert_out);
+            return 1;
+        }
+        free_background();
+        printf("Converted %s -> %s (%ux%u Farbfeld%s)\n",
+               cfg.convert_in, cfg.convert_out, src_w, src_h,
+               cfg.blur_radius > 0 ? ", blurred" : "");
+        return 0;
+    }
+
     if (sep < 0 || sep + 1 >= argc) {
         print_usage(argv[0]);
         return 2;
@@ -710,6 +980,9 @@ int main(int argc, char **argv) {
 
     if (load_background(cfg.bg_path, &cfg.bg_w, &cfg.bg_h) < 0)
         execvp(child_argv[0], child_argv);
+
+    if (cfg.blur_radius > 0)
+        box_blur_bg(cfg.bg_w, cfg.bg_h, cfg.blur_radius);
 
     int fn_fd = open(cfg.font_path, O_RDONLY);
     struct stat fn_st;
