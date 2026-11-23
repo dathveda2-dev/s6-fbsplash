@@ -9,6 +9,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <signal.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -745,6 +746,15 @@ static void init_grid(uint32_t xres, uint32_t yres, const psf2_hdr_t *hdr, const
     feed_bytes((const uint8_t *)banner, (ssize_t)strlen(banner));
 }
 
+static int g_tty_fd = -1;
+
+static void on_term_signal(int sig) {
+    (void)sig;
+    if (g_tty_fd >= 0)
+        ioctl(g_tty_fd, KDSETMODE, KD_TEXT);
+    _exit(128 + sig);
+}
+
 static int run_pty_loop(char **child_argv, uint8_t *fb, uint32_t stride,
                         uint32_t xres, uint32_t yres, const uint8_t *glyphs,
                         const psf2_hdr_t *hdr, const config_t *cfg, int tty_fd) {
@@ -1053,14 +1063,20 @@ int main(int argc, char **argv) {
     init_grid(vinfo.xres, vinfo.yres, hdr, &cfg);
 
     int tty_fd = open(cfg.tty_path, O_RDWR);
-    if (tty_fd >= 0)
+    if (tty_fd >= 0) {
+        g_tty_fd = tty_fd;
+        signal(SIGTERM, on_term_signal);
+        signal(SIGINT, on_term_signal);
+        signal(SIGHUP, on_term_signal);
         ioctl(tty_fd, KDSETMODE, KD_GRAPHICS);
+    }
 
     int rc = run_pty_loop(child_argv, fb, finfo.line_length,
                           vinfo.xres, vinfo.yres, glyphs, hdr, &cfg, tty_fd);
 
     if (tty_fd >= 0) {
         ioctl(tty_fd, KDSETMODE, KD_TEXT);
+        g_tty_fd = -1;
         close(tty_fd);
     }
     free(bg_panel);
